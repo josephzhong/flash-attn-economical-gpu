@@ -36,6 +36,7 @@ def _flash_attn_fwd_kernel(
     D,
     sm_scale,
     causal: tl.constexpr,
+    HAS_LSE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
@@ -58,7 +59,7 @@ def _flash_attn_fwd_kernel(
         + offs_d[None, :] * stride_qd
     )
     q_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D)
-    q = tl.load(q_ptrs, mask=q_mask, other=0.0).to(tl.float32)
+    q = tl.load(q_ptrs, mask=q_mask, other=0.0)
 
     m_i = tl.full((BLOCK_M,), float("-inf"), tl.float32)
     l_i = tl.zeros((BLOCK_M,), dtype=tl.float32)
@@ -83,10 +84,10 @@ def _flash_attn_fwd_kernel(
         )
 
         kv_mask = (cur_n[:, None] < N) & (offs_d[None, :] < D)
-        k = tl.load(k_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
-        v = tl.load(v_ptrs, mask=kv_mask, other=0.0).to(tl.float32)
+        k = tl.load(k_ptrs, mask=kv_mask, other=0.0)
+        v = tl.load(v_ptrs, mask=kv_mask, other=0.0)
 
-        qk = tl.dot(q, tl.trans(k)) * sm_scale
+        qk = tl.dot(q, tl.trans(k), out_dtype=tl.float32) * sm_scale
 
         in_bounds = (offs_m[:, None] < M) & (cur_n[None, :] < N)
         qk = tl.where(in_bounds, qk, float("-inf"))
@@ -101,7 +102,7 @@ def _flash_attn_fwd_kernel(
 
         alpha = tl.exp(m_i - m_ij)
         acc = acc * alpha[:, None]
-        acc = acc + tl.dot(p, v)
+        acc = acc + tl.dot(p.to(v.dtype), v, out_dtype=tl.float32)
 
         l_i = l_i * alpha + l_ij
         m_i = m_ij
@@ -118,7 +119,7 @@ def _flash_attn_fwd_kernel(
     o_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D)
     tl.store(o_ptrs, out, mask=o_mask)
 
-    if lse_ptr != 0:
+    if HAS_LSE:
         lse_ptrs = lse_ptr + b * stride_lb + h * stride_lh + offs_m * stride_lm
         lse = m_i + tl.log(l_i)
         tl.store(lse_ptrs, lse, mask=offs_m < M)
@@ -212,6 +213,7 @@ def flash_attention_2(
         D,
         sm_scale,
         causal=causal,
+        HAS_LSE=lse is not None,
         BLOCK_M=BLOCK_M,
         BLOCK_N=BLOCK_N,
         BLOCK_DMODEL=BLOCK_DMODEL,

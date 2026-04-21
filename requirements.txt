@@ -1,7 +1,7 @@
 # Core runtime for flash_atten.py
 # Latest stable versions observed on PyPI as of 2026-03-28.
-torch==2.10.0
-triton==3.6.0
+torch==2.6.0
+triton==3.2.0
 
 # Test runner for test_flash_atten.py
 pytest==9.0.2
