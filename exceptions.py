@@ -1,10 +1,79 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import asdict, is_dataclass
 from typing import Any
 
 import triton
 from triton.runtime.errors import OutOfResources
+
+
+def _format_tune_args(tune_args: Any | None) -> str | None:
+    if tune_args is None:
+        return None
+    if is_dataclass(tune_args):
+        values = asdict(tune_args)
+    elif isinstance(tune_args, Mapping):
+        values = dict(tune_args)
+    else:
+        values = {
+            key: getattr(tune_args, key)
+            for key in dir(tune_args)
+            if key.isupper() and not key.startswith("_")
+        }
+    formatted = ", ".join(f"{key}={value}" for key, value in values.items() if value is not None)
+    return formatted or None
+
+
+def _format_input_shapes(input_shapes: Any | None) -> str | None:
+    if input_shapes is None:
+        return None
+    if isinstance(input_shapes, Mapping):
+        values = dict(input_shapes)
+    else:
+        values = {"input_shapes": input_shapes}
+    formatted = ", ".join(f"{key}={value}" for key, value in values.items() if value is not None)
+    return formatted or None
+
+
+def _resource_usage_summary(
+    name: str,
+    launch_context: Mapping[str, Any] | None,
+    tune_args: Any | None = None,
+    input_shapes: Any | None = None,
+) -> str:
+    launch_context = launch_context or {}
+    shared_used = int(
+        launch_context.get(
+            "compiled_shared_memory_bytes_per_block",
+            launch_context.get("attempted_shared_memory_bytes_per_block", 0),
+        )
+    )
+    shared_total = int(launch_context.get("available_shared_memory_bytes_per_sm", 0))
+    register_file_used = int(launch_context.get("attempted_register_file_size_bytes_per_block", 0))
+    register_file_total = int(launch_context.get("available_register_file_size_bytes_per_sm", 0))
+    registers_used = int(launch_context.get("attempted_registers_per_block", 0))
+    registers_total = int(launch_context.get("available_registers_per_sm", 0))
+    summary = (
+        f"{name} tuner resources: \n"
+        f"shared={shared_used}/{shared_total} bytes per block/SM, \n"
+        f"register_file={register_file_used}/{register_file_total} bytes per block/SM, \n"
+        f"registers={registers_used}/{registers_total} per block/SM "
+    )
+    formatted_tune_args = _format_tune_args(tune_args)
+    if formatted_tune_args:
+        summary += f", \ntune_args={formatted_tune_args}"
+    formatted_input_shapes = _format_input_shapes(input_shapes)
+    if formatted_input_shapes:
+        summary += f", \ninput_shapes={formatted_input_shapes}"
+    return summary
+
+
+def _resource_failure_text(prefix: str, exc: "OutOfResourcesWithDetail") -> str:
+    launch_context = getattr(exc, "launch_context", {}) or {}
+    return f"{prefix}: {exc} [{_resource_usage_summary('failed', launch_context)}]"
+
+
 
 
 class OutOfResourcesWithDetail(OutOfResources):

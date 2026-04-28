@@ -13,7 +13,11 @@ import triton
 from triton.compiler import make_backend
 from triton.runtime import driver
 
-from flash_atten import _flash_attn_fwd_kernel, _select_block_dmodel, flash_attention_2
+from flash_atten import (
+    FlashAttentionTuner,
+    _flash_attn_fwd_kernel,
+    flash_attention_2,
+)
 
 try:
     from torch.nn.attention import SDPBackend, sdpa_kernel
@@ -117,55 +121,25 @@ def _get_triton_flash_kernel_call(
     return_lse: bool,
 ):
     B, H, M, D = q.shape
-    _, _, N, _ = k.shape
-    block_dmodel = _select_block_dmodel(D)
-    num_warps = 4 if D <= 64 else 8
     o = torch.empty_like(q)
     lse = torch.empty((B, H, M), device=q.device, dtype=torch.float32) if return_lse else None
-    args = (
+    launch_spec = FlashAttentionTuner(
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        causal=causal,
+        return_lse=lse is not None,
+    ).build_launch_spec(
         q,
         k,
         v,
-        o,
-        lse if lse is not None else 0,
-        q.stride(0),
-        q.stride(1),
-        q.stride(2),
-        q.stride(3),
-        k.stride(0),
-        k.stride(1),
-        k.stride(2),
-        k.stride(3),
-        v.stride(0),
-        v.stride(1),
-        v.stride(2),
-        v.stride(3),
-        o.stride(0),
-        o.stride(1),
-        o.stride(2),
-        o.stride(3),
-        (lse.stride(0) if lse is not None else 0),
-        (lse.stride(1) if lse is not None else 0),
-        (lse.stride(2) if lse is not None else 0),
-        B,
-        H,
-        M,
-        N,
-        D,
-        D ** -0.5,
+        sm_scale=D ** -0.5,
+        o=o,
+        lse=lse,
     )
-    kwargs = {
-        "causal": causal,
-        "HAS_LSE": lse is not None,
-        "BLOCK_M": 64,
-        "BLOCK_N": 64,
-        "BLOCK_DMODEL": block_dmodel,
-        "num_warps": num_warps,
-        "num_stages": 2,
-        "debug": False,
-    }
-    return args, kwargs, o, lse
-
+    kwargs = dict(launch_spec.kernel_kwargs)
+    kwargs["debug"] = False
+    return launch_spec.kernel_args, kwargs, o, lse
 
 def _get_exact_triton_cache_key(
     q: torch.Tensor,
@@ -204,7 +178,13 @@ def _compile_triton_flash_with_real_inputs(
     cache_key = _get_exact_triton_cache_key(q, k, v, causal=causal, return_lse=return_lse)
     if cache_key not in cache:
         try:
-            out = flash_attention_2(q, k, v, causal=causal, return_lse=return_lse)
+            out = flash_attention_2(
+                q,
+                k,
+                v,
+                causal=causal,
+                return_lse=return_lse,
+            )
             torch.cuda.synchronize()
             del out
         except Exception as exc:
@@ -278,7 +258,12 @@ def _maybe_run_torch_sdpa(q, k, v, causal: bool, backend_name: str):
 
 def _maybe_run_triton_flash(q, k, v, causal: bool):
     try:
-        out = flash_attention_2(q, k, v, causal=causal)
+        out = flash_attention_2(
+            q,
+            k,
+            v,
+            causal=causal,
+        )
         torch.cuda.synchronize()
         return out, None
     except Exception as exc:
@@ -417,7 +402,16 @@ def _run_kernel_pipeline(attention_inputs):
         ("cpu_sdpa", lambda: _run_cpu_sdpa(q_cpu, k_cpu, v_cpu, causal=causal), "cpu"),
         ("gpu_math_sdpa", lambda: _run_torch_sdpa(q, k, v, causal=causal, backend_name="math"), "cuda"),
         ("gpu_flash_sdpa", lambda: _run_torch_sdpa(q, k, v, causal=causal, backend_name="flash"), "cuda"),
-        ("triton_flash", lambda: flash_attention_2(q, k, v, causal=causal), "cuda"),
+        (
+            "triton_flash",
+            lambda: flash_attention_2(
+                q,
+                k,
+                v,
+                causal=causal,
+            ),
+            "cuda",
+        ),
     ]
 
     availability = {}

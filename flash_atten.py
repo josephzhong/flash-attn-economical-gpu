@@ -1,3 +1,4 @@
+import logging
 from dataclasses import dataclass
 from typing import Any
 
@@ -9,10 +10,13 @@ from triton.runtime.errors import OutOfResources
 
 from exceptions import (
     OutOfResourcesWithDetail,
+    _resource_usage_summary,
     estimate_flash_fwd_shared_bytes,
     get_sm_resource_limits,
 )
 from tuner import LaunchSpec, Tuner
+
+logger = logging.getLogger(__name__)
 
 
 @triton.jit
@@ -490,7 +494,9 @@ class FlashAttentionTuner(Tuner):
 
         cached = self._config_cache.get(self._cache_key(q))
         if cached is not None:
-            config, launch_context = cached
+            selected_config, selected_context = cached
+            selected_config = dict(selected_config)
+            selected_context = dict(selected_context)
             launch_spec = self._build_candidate_launch(
                 q,
                 k,
@@ -498,142 +504,81 @@ class FlashAttentionTuner(Tuner):
                 sm_scale=sm_scale,
                 o=o,
                 lse=lse,
-                config=dict(config),
-                launch_context=dict(launch_context),
+                config=selected_config,
+                launch_context=selected_context,
             )
-            return FlashAttentionLaunchSpec(
-                grid=launch_spec.grid,
-                kernel_args=launch_spec.kernel_args,
-                kernel_kwargs=launch_spec.kernel_kwargs,
-                launch_context=launch_spec.launch_context
-            )
+        else:
+            best_spec: FlashAttentionLaunchSpec | None = None
+            best_config: dict[str, int | bool] | None = None
+            best_rank: tuple[int, int, int, int] | None = None
+            fallback_context: dict[str, object] | None = None
 
-        best_spec: FlashAttentionLaunchSpec | None = None
-        best_rank: tuple[int, int, int, int] | None = None
-        fallback_context: dict[str, object] | None = None
+            for config in self._candidate_configs():
+                feasible, launch_spec = self.evaluate_candidate(
+                    q,
+                    k,
+                    v,
+                    sm_scale=sm_scale,
+                    o=o,
+                    lse=lse,
+                    config=config,
+                )
+                fallback_context = launch_spec.launch_context
+                if not feasible:
+                    continue
+                rank = (
+                    int(launch_spec.launch_context.get("compiled_shared_memory_bytes_per_block", launch_spec.launch_context["attempted_shared_memory_bytes_per_block"])),
+                    int(launch_spec.launch_context.get("attempted_register_file_size_bytes_per_block", 0)),
+                    int(config["BLOCK_N_PAD"]),
+                    int(config["BLOCK_M"]),
+                )
+                if best_rank is None or rank > best_rank:
+                    best_rank = rank
+                    best_spec = launch_spec
 
-        for config in self._candidate_configs():
-            feasible, launch_spec = self.evaluate_candidate(
-                q,
-                k,
-                v,
-                sm_scale=sm_scale,
-                o=o,
-                lse=lse,
-                config=config,
-            )
-            fallback_context = launch_spec.launch_context
-            if not feasible:
-                continue
-            rank = (
-                int(launch_spec.launch_context.get("compiled_shared_memory_bytes_per_block", launch_spec.launch_context["attempted_shared_memory_bytes_per_block"])),
-                int(launch_spec.launch_context.get("attempted_register_file_size_bytes_per_block", 0)),
-                int(config["BLOCK_N_PAD"]),
-                int(config["BLOCK_M"]),
-            )
-            if best_rank is None or rank > best_rank:
-                best_rank = rank
-                best_spec = launch_spec
-
-        if best_spec is None:
-            context = fallback_context or dict(self.sm_limits)
-            context.setdefault(
-                "attempted_shared_memory_bytes_per_block",
-                estimate_flash_fwd_shared_bytes(
-                    block_m=max(1, self.tune_args.BLOCK_M or 1),
-                    block_n_pad=self.tune_args.BLOCK_N_PAD
-                    or _next_power_of_two(self.tune_args.BLOCK_N or min(max(16, self.N), 128)),
-                    block_dmodel=self.tune_args.BLOCK_DMODEL or _select_block_dmodel(self.D),
-                    element_size=q.element_size(),
-                ),
-            )
-            register_bytes = int(context.get("attempted_register_file_size_bytes_per_block", 0))
-            if register_bytes > self.sm_limits["available_register_file_size_bytes_per_sm"]:
+            if best_spec is None:
+                context = fallback_context or dict(self.sm_limits)
+                context.setdefault(
+                    "attempted_shared_memory_bytes_per_block",
+                    estimate_flash_fwd_shared_bytes(
+                        block_m=max(1, self.tune_args.BLOCK_M or 1),
+                        block_n_pad=self.tune_args.BLOCK_N_PAD
+                        or _next_power_of_two(self.tune_args.BLOCK_N or min(max(16, self.N), 128)),
+                        block_dmodel=self.tune_args.BLOCK_DMODEL or _select_block_dmodel(self.D),
+                        element_size=q.element_size(),
+                    ),
+                )
+                register_bytes = int(context.get("attempted_register_file_size_bytes_per_block", 0))
+                if register_bytes > self.sm_limits["available_register_file_size_bytes_per_sm"]:
+                    raise OutOfResourcesWithDetail(
+                        int(context.get("attempted_registers_per_block", 0)),
+                        self.sm_limits["available_registers_per_sm"],
+                        "registers",
+                        kernel_name="_flash_attn_fwd_kernel",
+                        launch_context=context,
+                        extra_detail="No candidate flash-attention block fit the one-SM register-file limit after lowering shared-memory usage",
+                    )
                 raise OutOfResourcesWithDetail(
-                    int(context.get("attempted_registers_per_block", 0)),
-                    self.sm_limits["available_registers_per_sm"],
-                    "registers",
+                    int(context.get("attempted_shared_memory_bytes_per_block", 0)),
+                    self.sm_limits["available_shared_memory_bytes_per_sm"],
+                    "shared memory",
                     kernel_name="_flash_attn_fwd_kernel",
                     launch_context=context,
-                    extra_detail="No candidate flash-attention block fit the one-SM register-file limit after lowering shared-memory usage",
+                    extra_detail="No candidate flash-attention block fit the one-SM shared-memory limit",
                 )
-            raise OutOfResourcesWithDetail(
-                int(context.get("attempted_shared_memory_bytes_per_block", 0)),
-                self.sm_limits["available_shared_memory_bytes_per_sm"],
-                "shared memory",
-                kernel_name="_flash_attn_fwd_kernel",
-                launch_context=context,
-                extra_detail="No candidate flash-attention block fit the one-SM shared-memory limit",
+            selected_config = best_config
+            launch_spec = best_spec
+            self._config_cache[self._cache_key(q)] = (
+                dict(best_config),
+                dict(best_spec.launch_context),
             )
-
-        self._config_cache[self._cache_key(q)] = (
-            dict(best_spec.kernel_kwargs),
-            dict(best_spec.launch_context)
-        )
-        return best_spec
-
-
-def select_block_m_for_shared_memory(
-    *,
-    M: int,
-    block_n: int=64,
-    D: int=128,
-    dtype: torch.dtype=torch.float16
-) -> int:
-    block_n_pad = _next_power_of_two(block_n)
-    while block_n_pad > 0:
-        block_dmodel = _select_block_dmodel(D)
-        element_size = torch.empty((), dtype=dtype).element_size()
-        max_shared_mem = _get_max_shared_mem_bytes()
-        if M <= 0:
-            raise ValueError("M must be positive")
-        preferred = _default_block_m(block_n_pad)
-        candidate = preferred
-        while candidate >= 1:
-            required = estimate_flash_fwd_shared_bytes(
-                block_m=candidate,
-                block_n_pad=block_n_pad,
-                block_dmodel=block_dmodel,
-                element_size=element_size,
-            )
-            if required <= max_shared_mem:
-                return candidate, block_n_pad
-            candidate //= 2
-        block_n_pad //= 2
-
-    min_required = estimate_flash_fwd_shared_bytes(
-        block_m=1,
-        block_n_pad=block_n_pad,
-        block_dmodel=block_dmodel,
-        element_size=element_size,
-    )
-    raise OutOfResourcesWithDetail(
-        min_required,
-        max_shared_mem,
-        "shared memory",
-        kernel_name="_flash_attn_fwd_kernel",
-        launch_context={
-            **get_sm_resource_limits(),
-            "attempted_shared_memory_bytes_per_block": min_required,
-        },
-        extra_detail=(
-            "No valid block configuration fit within the shared-memory budget for one SM-resident block "
-            f"(BLOCK_M=1, BLOCK_N_PAD={block_n_pad}, BLOCK_DMODEL={block_dmodel}, dtype={dtype})"
-        ),
-    )
+        return launch_spec
 
 
 def _next_power_of_two(x: int) -> int:
     if x <= 0:
         raise ValueError("x must be positive")
     return 1 << (x - 1).bit_length()
-
-
-def _select_block_dmodel(d: int) -> int:
-    for candidate in (16, 32, 64, 128, 256):
-        if d <= candidate:
-            return candidate
-    raise ValueError(f"Head dimension {d} is too large; expected <= 256")
 
 
 def flash_attention_2(
@@ -645,6 +590,7 @@ def flash_attention_2(
     return_lse: bool = False,
     block_n: int | None = None,
     block_m: int | None = None,
+    print_resource_usage: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     FlashAttention-2 style forward kernel implemented with OpenAI Triton.
@@ -709,6 +655,14 @@ def flash_attention_2(
         o=o,
         lse=lse,
     )
+    if print_resource_usage:
+        summary = _resource_usage_summary(
+            "flash_attention_2",
+            launch_spec.launch_context,
+            launch_spec.tune_args,
+            launch_spec.input_shapes,
+        )
+        logger.info(summary)
     try:
         _flash_attn_fwd_kernel[launch_spec.grid](*launch_spec.kernel_args, **launch_spec.kernel_kwargs)
     except OutOfResources as exc:
