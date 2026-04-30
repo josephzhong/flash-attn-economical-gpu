@@ -4,6 +4,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, is_dataclass
 from typing import Any
 
+import torch
 import triton
 from triton.runtime.errors import OutOfResources
 
@@ -144,22 +145,16 @@ class OutOfResourcesWithDetail(OutOfResources):
 def get_sm_resource_limits() -> dict[str, Any]:
     device = triton.runtime.driver.active.get_current_device()
     props = triton.runtime.driver.active.utils.get_device_properties(device)
+    torch_props = torch.cuda.get_device_properties(device)
     max_num_regs = props["max_num_regs"]
+    warp_size = props["warpSize"]
+    max_threads_per_block = int(getattr(torch_props, "max_threads_per_block", 1024))
     return {
         "available_shared_memory_bytes_per_sm": props["max_shared_mem"],
         "available_registers_per_sm": max_num_regs,
         "available_register_file_size_bytes_per_sm": max_num_regs * 4,
-        "warp_size": props["warpSize"],
+        "warp_size": warp_size,
+        "max_threads_per_block": max_threads_per_block,
+        "max_warps_per_block": max(1, max_threads_per_block // max(1, warp_size)),
         "multiprocessor_count": props["multiprocessor_count"],
     }
-
-
-def estimate_flash_fwd_shared_bytes(
-    *,
-    block_m: int,
-    block_n_pad: int,
-    block_dmodel: int,
-    element_size: int,
-) -> int:
-    # Triton stages q, k, and v tiles in shared memory for the two tl.dot calls.
-    return element_size * block_dmodel * (block_m + 2 * block_n_pad)
