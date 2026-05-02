@@ -87,8 +87,7 @@ class FlashAttenTuneArguments:
 
 
 class FlashAttentionTuner(Tuner):
-    KERNEL_NAME = "_flash_attn_fwd_kernel"
-    FUNCTION_NAME = "flash_attention_2"
+    KERNEL_NAME = "_flash_attn_fwd_kernel_basic"
     _config_cache: dict[tuple[object, ...], tuple[dict[str, int | bool], dict[str, object]]] = {}
 
     def __init__(
@@ -312,7 +311,7 @@ class FlashAttentionTuner(Tuner):
             kernel_args=kernel_args,
             kernel_kwargs=kernel_kwargs,
             launch_context=launch_context,
-            function_name=self.FUNCTION_NAME,
+            function_name=self.KERNEL_NAME,
             tune_args=FlashAttenTuneArguments(
                 BLOCK_N=int(config["BLOCK_N"]),
                 BLOCK_M=int(config["BLOCK_M"]),
@@ -580,10 +579,41 @@ class FlashAttentionTuner(Tuner):
         return launch_spec
 
 
+class FlashAttentionOptimizeSharedMemTuner(FlashAttentionTuner):
+    KERNEL_NAME = "_flash_attn_fwd_kernel_optimize_shared_mem"
+    _config_cache: dict[tuple[object, ...], tuple[dict[str, int | bool], dict[str, object]]] = {}
+
+    def _block_n_pad_candidates(self, block_d_model: int) -> list[int]:
+        if self.tune_args.BLOCK_N_PAD is not None:
+            return [self.tune_args.BLOCK_N_PAD]
+        min_pad = _next_power_of_two(self.tune_args.BLOCK_N) if self.tune_args.BLOCK_N is not None else 16
+        max_shared_memory_element_cnt = _get_max_shared_mem_bytes() / self.dtype_size
+        max_pad = _next_power_of_two(int(max_shared_memory_element_cnt / block_d_model / 2))
+        if min_pad > max_pad:
+            max_pad = min_pad
+        return [pad for pad in self._power_of_two_candidates(max_pad, minimum=16) if pad >= min_pad]
+
+    def _block_m_candidates(self, block_n_pad: int) -> list[int]:
+        if self.tune_args.BLOCK_M is not None:
+            return [self.tune_args.BLOCK_M]
+        return [block_n_pad]
+
+    def estimate_flash_fwd_shared_bytes(
+        self,
+        *,
+        block_m: int,
+        block_n_pad: int,
+        block_dmodel: int,
+        element_size: int,
+    ) -> int:
+        return element_size * block_dmodel * (block_m + block_n_pad)
+
+
 __all__ = [
     "FlashAttenTuneArguments",
     "FlashAttentionLaunchSpec",
     "FlashAttentionTuner",
+    "FlashAttentionOptimizeSharedMemTuner",
     "LaunchSpec",
     "Tuner",
     "_get_max_shared_mem_bytes",

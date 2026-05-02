@@ -14,8 +14,8 @@ from triton.compiler import make_backend
 from triton.runtime import driver
 
 from flash_atten import (
-    _flash_attn_fwd_kernel,
-    flash_attention_2,
+    _flash_attn_fwd_kernel_basic,
+    flash_attention,
 )
 from tuner import FlashAttentionTuner
 
@@ -39,7 +39,7 @@ TEST_RUN_LOG_PATH = TEST_LOG_DIR / f"{TEST_RUN_START_TIMESTAMP}_test_attention_k
 
 def _require_cuda():
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for Triton flash_attention_2 tests")
+        pytest.skip("CUDA is required for Triton flash_attention tests")
 
 
 def _require_sdpa_kernel_api():
@@ -142,12 +142,12 @@ def _get_exact_triton_cache_key(
 ):
     target = driver.active.get_current_target()
     backend = make_backend(target)
-    if _flash_attn_fwd_kernel.binder is None:
-        _flash_attn_fwd_kernel.create_binder(backend)
+    if _flash_attn_fwd_kernel_basic.binder is None:
+        _flash_attn_fwd_kernel_basic.create_binder(backend)
 
     args, kwargs, o, lse = _get_triton_flash_kernel_call(q, k, v, causal=causal, return_lse=return_lse)
     try:
-        _, sig_and_spec, constexpr_vals, _, excess_kwargs = _flash_attn_fwd_kernel.binder(*args, **kwargs)
+        _, sig_and_spec, constexpr_vals, _, excess_kwargs = _flash_attn_fwd_kernel_basic.binder(*args, **kwargs)
         return "".join(sig_and_spec) + str((constexpr_vals, excess_kwargs))
     finally:
         del o
@@ -166,7 +166,7 @@ def _compile_triton_flash_with_real_inputs(
     k = k.contiguous()
     v = v.contiguous()
     device = driver.active.get_current_device()
-    cache = _flash_attn_fwd_kernel.cache[device]
+    cache = _flash_attn_fwd_kernel_basic.cache[device]
     cache_key = _get_exact_triton_cache_key(q, k, v, causal=causal, return_lse=return_lse)
     if cache_key not in cache:
         try:
@@ -178,7 +178,7 @@ def _compile_triton_flash_with_real_inputs(
                 causal=causal,
                 return_lse=return_lse,
             ).build_flash_attention_launch_spec(q, k, v)
-            out = flash_attention_2(launch_spec)
+            out = flash_attention(launch_spec)
             torch.cuda.synchronize()
             del out
         except Exception as exc:
@@ -260,11 +260,11 @@ def _maybe_run_triton_flash(q, k, v, causal: bool):
             causal=causal,
             return_lse=False,
         ).build_flash_attention_launch_spec(q, k, v)
-        out = flash_attention_2(launch_spec)
+        out = flash_attention(launch_spec)
         torch.cuda.synchronize()
         return out, None
     except Exception as exc:
-        return None, f"Triton flash_attention_2 is unavailable for this shape/device: {exc}"
+        return None, f"Triton flash_attention is unavailable for this shape/device: {exc}"
 
 
 def _make_inputs(B: int, H: int, D: int, S: int):
@@ -401,7 +401,7 @@ def _run_kernel_pipeline(attention_inputs):
         ("gpu_flash_sdpa", lambda: _run_torch_sdpa(q, k, v, causal=causal, backend_name="flash"), "cuda"),
         (
             "triton_flash",
-            lambda: flash_attention_2(
+            lambda: flash_attention(
                 FlashAttentionTuner(
                     tuple(q.shape),
                     tuple(k.shape),

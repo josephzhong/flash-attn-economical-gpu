@@ -4,13 +4,13 @@ Use this file as the project handoff context for AI coding tools.
 
 ## Required Python Interpreter
 
-- Always use: `/home/azureuser/miniconda3/envs/py312/bin/python`
+- Always use: `~/miniconda3/envs/py312/bin/python`
 - VS Code workspace default is pinned in `.vscode/settings.json`.
 
 ## Environment Setup
 
 ```bash
-/home/azureuser/miniconda3/envs/py312/bin/python -m pip install -r requirements.txt
+~/miniconda3/envs/py312/bin/python -m pip install -r requirements.txt
 ```
 
 ## Test Commands
@@ -18,13 +18,13 @@ Use this file as the project handoff context for AI coding tools.
 Run the main test script directly:
 
 ```bash
-/home/azureuser/miniconda3/envs/py312/bin/python test_flash_atten.py
+~/miniconda3/envs/py312/bin/python test_flash_atten.py
 ```
 
 Run all pytest tests:
 
 ```bash
-/home/azureuser/miniconda3/envs/py312/bin/python -m pytest -q
+~/miniconda3/envs/py312/bin/python -m pytest -q
 ```
 
 ## Useful Project Context
