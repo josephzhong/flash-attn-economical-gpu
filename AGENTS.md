@@ -39,5 +39,5 @@ Run all pytest tests:
 
 ## Current Behavior Notes
 
-- `flash_attention_2(...)` supports `print_resource_usage=False` and print tuner resource summaries internally when enabled.
+- - `flash_attention(...)` in the flash_atten.py is the unified entrance for all flash attention kernel functions.
 - Flash-attention launch configuration selection is handled by `FlashAttentionTuner`; callers and tests should not precompute `BLOCK_M`.

@@ -277,7 +277,6 @@ class FlashAttentionTuner(Tuner):
             (lse.stride(0) if lse is not None else 0),
             (lse.stride(1) if lse is not None else 0),
             (lse.stride(2) if lse is not None else 0),
-            self.B,
             self.H,
             self.M,
             self.N,

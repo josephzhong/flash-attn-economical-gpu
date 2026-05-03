@@ -43,7 +43,7 @@ def _block_n_sweep_values(seq_len: int) -> list[int]:
 
 def _require_cuda():
     if not torch.cuda.is_available():
-        pytest.skip("CUDA is required for Triton flash_attention_2 profiling tests")
+        pytest.skip("CUDA is required for Triton flash_attention profiling tests")
 
 @pytest.mark.parametrize("block_n", _block_n_sweep_values(QWEN35_9B_CASE[2]))
 def test_flash_attention_profiler_qwen35_9b_case(
