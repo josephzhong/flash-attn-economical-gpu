@@ -11,4 +11,9 @@ torch==2.9.1+cu128
 pytest==9.0.2
 psutil
 
-# install lastest official flash attention 2 later
+# Hugging Face runtime for ttft.py. Transformers 5.5.x includes Qwen3.5 support
+# and resolves cleanly with the pinned PyTorch 2.9.1 + CUDA 12.8 stack above.
+transformers==5.5.4
+accelerate==1.13.0
+
+# install latest official flash attention 2 later
