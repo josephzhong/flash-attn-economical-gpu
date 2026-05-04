@@ -75,6 +75,7 @@ class FlashAttenTuneArguments:
     BLOCK_M: int | None = None
     BLOCK_N_PAD: int | None = None
     BLOCK_DMODEL: int | None = None
+    BLOCK_DMODEL_OUTER: int | None = None
     NUM_WARPS: int | None = None
     NUM_STAGES: int | None = None
 
@@ -96,10 +97,21 @@ class FlashAttenTuneArguments:
                 raise ValueError("BLOCK_DMODEL must be positive when provided")
             if _next_power_of_two(self.BLOCK_DMODEL) != self.BLOCK_DMODEL:
                 raise ValueError("BLOCK_DMODEL must be a power of 2 when provided")
+        if self.BLOCK_DMODEL_OUTER is not None:
+            if self.BLOCK_DMODEL_OUTER <= 0:
+                raise ValueError("BLOCK_DMODEL_OUTER must be positive when provided")
+            if _next_power_of_two(self.BLOCK_DMODEL_OUTER) != self.BLOCK_DMODEL_OUTER:
+                raise ValueError("BLOCK_DMODEL_OUTER must be a power of 2 when provided")
         if self.NUM_WARPS is not None and self.NUM_WARPS <= 0:
             raise ValueError("NUM_WARPS must be positive when provided")
         if self.NUM_STAGES is not None and self.NUM_STAGES <= 0:
             raise ValueError("NUM_STAGES must be positive when provided")
+
+
+def next_power_of_two(x: int) -> int:
+    if x <= 0:
+        raise ValueError("x must be positive")
+    return 1 << (x - 1).bit_length()
 
 
 class FlashAttentionTuner(Tuner):
@@ -134,7 +146,7 @@ class FlashAttentionTuner(Tuner):
         self.tune_args = tune_args or FlashAttenTuneArguments()
         self.B, self.H, self.M, self.D = self.q_shape
         _, _, self.N, _ = self.k_shape
-        if self.tune_args.BLOCK_DMODEL is not None and self.tune_args.BLOCK_DMODEL < self.D:
+        if self.tune_args.BLOCK_DMODEL is not None and self.tune_args.BLOCK_DMODEL < self.D and not self._allow_block_dmodel_smaller_than_d():
             raise ValueError("BLOCK_DMODEL must be >= D when provided")
         if self.tune_args.BLOCK_N_PAD is not None and self.tune_args.BLOCK_N is not None:
             if self.tune_args.BLOCK_N > self.tune_args.BLOCK_N_PAD:
@@ -162,7 +174,10 @@ class FlashAttentionTuner(Tuner):
             self.tune_args.NUM_WARPS,
             self.tune_args.NUM_STAGES,
         )
-
+    
+    def _allow_block_dmodel_smaller_than_d(self) -> bool:
+        return False
+    
     def _power_of_two_candidates(self, upper_bound: int, minimum: int = 1) -> list[int]:
         values: list[int] = []
         value = 1 << (max(minimum, upper_bound) - 1).bit_length()
@@ -180,38 +195,27 @@ class FlashAttentionTuner(Tuner):
     def _block_n_pad_candidates(self, block_d_model: int) -> list[int]:
         if self.tune_args.BLOCK_N_PAD is not None:
             return [self.tune_args.BLOCK_N_PAD]
-        min_pad = _next_power_of_two(self.tune_args.BLOCK_N) if self.tune_args.BLOCK_N is not None else 16
-        max_shared_memory_element_cnt = _get_max_shared_mem_bytes() / self.dtype_size
-        max_pad = _next_power_of_two(int(max_shared_memory_element_cnt / block_d_model / 4))
-        if min_pad > max_pad:
-            max_pad = min_pad
-        return [pad for pad in self._power_of_two_candidates(max_pad, minimum=16) if pad >= min_pad]
+        max_pad = min(256, block_d_model)
+        return [pad for pad in self._power_of_two_candidates(max_pad, minimum=16)]
 
     def _block_m_candidates(self, block_n_pad: int) -> list[int]:
         if self.tune_args.BLOCK_M is not None:
             return [self.tune_args.BLOCK_M]
-        return [block_n_pad * 2]
+        return [m for m in self._power_of_two_candidates(256, minimum=16)]
 
-    def _block_n_candidates(self, block_n_pad: int) -> list[int]:
+    def _block_n_candidates(self, block_n_pad) -> list[int]:
         if self.tune_args.BLOCK_N is not None:
             return [self.tune_args.BLOCK_N] if self.tune_args.BLOCK_N <= block_n_pad else []
-        upper = min(block_n_pad, max(16, min(self.N, 128)))
-        exact = min(self.N, block_n_pad)
-        values = self._power_of_two_candidates(max(16, upper), minimum=16)
-        if exact > 0 and exact <= block_n_pad and exact not in values:
-            values.insert(0, exact)
-        deduped: list[int] = []
-        seen = set()
-        for value in values:
-            if value <= block_n_pad and value not in seen:
-                deduped.append(value)
-                seen.add(value)
-        return deduped
+        return [block_n_pad]
 
     def _block_dmodel_candidates(self) -> list[int]:
         if self.tune_args.BLOCK_DMODEL is not None:
-            return [self.tune_args.BLOCK_DMODEL]
-        return [max(16, _next_power_of_two(self.D))]
+            if self.tune_args.BLOCK_DMODEL >= self.D or self._allow_block_dmodel_smaller_than_d():
+                return [self.tune_args.BLOCK_DMODEL]
+            else:
+                raise ValueError(f"Block_DMODEL={self.tune_args.BLOCK_DMODEL} must be no less than D={self.D}")
+        max_d = min(128, max(16, next_power_of_two(self.D)))
+        return self._power_of_two_candidates(max_d, minimum=16)
 
     def _supported_num_warps(self) -> list[int]:
         max_warps = max(1, int(self.sm_limits.get("max_warps_per_block", 1)))
@@ -219,26 +223,16 @@ class FlashAttentionTuner(Tuner):
 
     def _num_warps(self, block_m: int, block_n: int, block_n_pad: int, block_dmodel: int) -> int:
         if self.tune_args.NUM_WARPS is not None:
-            return int(self.tune_args.NUM_WARPS)
+            return [int(self.tune_args.NUM_WARPS)]
         supported = self._supported_num_warps()
         if not supported:
-            return 1
-        tile_work = (
-            int(block_m) * int(block_n_pad)
-            + int(block_n_pad) * int(block_dmodel)
-            + int(block_m) * int(block_dmodel)
-        )
-        logical_span = max(int(block_n), int(block_n_pad))
-        estimated = max(1, math.ceil(max(tile_work, int(block_m) * logical_span) / 4096))
-        for warps in supported:
-            if warps >= estimated:
-                return warps
-        return supported[-1]
+            return [1]
+        return supported
 
     def _num_stages(self, block_n_pad: int) -> int:
         if self.tune_args.NUM_STAGES is not None:
-            return int(self.tune_args.NUM_STAGES)
-        return 1
+            return [int(self.tune_args.NUM_STAGES)]
+        return [i for i in range(1, 8)]
 
     def estimate_flash_fwd_shared_bytes(
         self,
@@ -408,8 +402,7 @@ class FlashAttentionTuner(Tuner):
         shared_ok = (
             int(
                 context.get(
-                    "compiled_shared_memory_bytes_per_block",
-                    context["attempted_shared_memory_bytes_per_block"],
+                    "compiled_shared_memory_bytes_per_block"
                 )
             )
             <= shared_limit
@@ -421,29 +414,31 @@ class FlashAttentionTuner(Tuner):
     def _candidate_configs(self) -> list[dict[str, int | bool]]:
         candidates: list[dict[str, int | bool]] = []
         for block_dmodel in self._block_dmodel_candidates():
-            if block_dmodel < self.D:
+            if block_dmodel < self.D and not self._allow_block_dmodel_smaller_than_d():
                 continue
             for block_n_pad in self._block_n_pad_candidates(block_dmodel):
                 for block_m in self._block_m_candidates(block_n_pad):
                     for block_n in self._block_n_candidates(block_n_pad):
-                        candidates.append(
-                            {
-                                "BLOCK_M": block_m,
-                                "BLOCK_N": block_n,
-                                "BLOCK_N_PAD": block_n_pad,
-                                "BLOCK_DMODEL": block_dmodel,
-                                "num_warps": self._num_warps(block_m, block_n, block_n_pad, block_dmodel),
-                                "num_stages": self._num_stages(block_n_pad),
-                            }
-                        )
-        return sorted(
+                        for num_warp in self._num_warps(block_m, block_n, block_n_pad, block_dmodel):
+                            for num_stage in self._num_stages(block_n_pad):
+                                candidates.append(
+                                    {
+                                        "BLOCK_M": block_m,
+                                        "BLOCK_N": block_n,
+                                        "BLOCK_N_PAD": block_n_pad,
+                                        "BLOCK_DMODEL": block_dmodel,
+                                        "num_warps": num_warp,
+                                        "num_stages": num_stage,
+                                    }
+                                )
+        sorted_candidates = sorted(
             candidates,
             key=lambda cfg: (
                 self.estimate_flash_fwd_shared_bytes(
                     block_m=int(cfg["BLOCK_M"]),
                     block_n_pad=int(cfg["BLOCK_N_PAD"]),
                     block_dmodel=int(cfg["BLOCK_DMODEL"]),
-                    element_size=self.dtype_size,
+                    element_size=self.dtype_size
                 ),
                 int(cfg["BLOCK_N"]),
                 int(cfg["BLOCK_N_PAD"]),
@@ -451,6 +446,7 @@ class FlashAttentionTuner(Tuner):
             ),
             reverse=True,
         )
+        return sorted_candidates
 
     def _validate_runtime_tensors(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor) -> None:
         if tuple(q.shape) != self.q_shape or tuple(k.shape) != self.k_shape or tuple(v.shape) != self.v_shape:
@@ -596,32 +592,147 @@ class FlashAttentionTuner(Tuner):
 
 class FlashAttentionOptimizeSharedMemTuner(FlashAttentionTuner):
     KERNEL_NAME = "_flash_attn_fwd_kernel_optimize_shared_mem"
-    _config_cache: dict[tuple[object, ...], tuple[dict[str, int | bool], dict[str, object]]] = {}
+    
 
-    def _block_n_pad_candidates(self, block_d_model: int) -> list[int]:
-        if self.tune_args.BLOCK_N_PAD is not None:
-            return [self.tune_args.BLOCK_N_PAD]
-        min_pad = _next_power_of_two(self.tune_args.BLOCK_N) if self.tune_args.BLOCK_N is not None else 16
-        max_shared_memory_element_cnt = _get_max_shared_mem_bytes() / self.dtype_size
-        max_pad = _next_power_of_two(int(max_shared_memory_element_cnt / block_d_model / 2))
-        if min_pad > max_pad:
-            max_pad = min_pad
-        return [pad for pad in self._power_of_two_candidates(max_pad, minimum=16) if pad >= min_pad]
+class FlashAttentionBlockDNomaskTuner(FlashAttentionTuner):
+    KERNEL_NAME = "_flash_attn_fwd_kernel_block_d_nomask_contiguous"
 
-    def _block_m_candidates(self, block_n_pad: int) -> list[int]:
-        if self.tune_args.BLOCK_M is not None:
-            return [self.tune_args.BLOCK_M]
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.max_tile_length = 128
+
+    def _allow_block_dmodel_smaller_than_d(self) -> bool:
+        return True
+
+    def _block_dmodel_outer_candidates(self) -> list[int]:
+        if self.tune_args.BLOCK_DMODEL_OUTER is not None:
+            return [self.tune_args.BLOCK_DMODEL_OUTER]
+        return [int(self.D), int(self.D / 2), int(self.D / 4)]
+
+    def _block_n_candidates(self, block_n_pad) -> list[int]:
+        if self.tune_args.BLOCK_N is not None:
+            return [self.tune_args.BLOCK_N] if self.tune_args.BLOCK_N <= block_n_pad else []
         return [block_n_pad]
+    
+    def _num_stages(self, block_n_pad):
+        if self.tune_args.NUM_STAGES is not None:
+            return [int(self.tune_args.NUM_STAGES)]
+        return [i for i in range(2, 6)]
 
-    def estimate_flash_fwd_shared_bytes(
+    def _num_warps(self, block_m: int, block_n: int, block_n_pad: int, block_dmodel: int) -> int:
+        if self.tune_args.NUM_WARPS is not None:
+            return [int(self.tune_args.NUM_WARPS)]
+        return [pow(2, i) for i in range(1, 5)]
+
+    def _build_candidate_launch(
         self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
         *,
-        block_m: int,
-        block_n_pad: int,
-        block_dmodel: int,
-        element_size: int,
-    ) -> int:
-        return element_size * block_dmodel * (block_m + block_n_pad)
+        sm_scale: float,
+        o: torch.Tensor,
+        lse: torch.Tensor | None,
+        config: dict[str, int | bool],
+        launch_context: dict[str, object] | None = None,
+    ) -> FlashAttentionLaunchSpec:
+        grid = (triton.cdiv(self.M, int(config["BLOCK_M"])), self.B * self.H)
+        kernel_args = (
+            q,
+            k,
+            v,
+            o,
+            self.H,
+            self.M,
+            self.N,
+            self.D,
+            sm_scale,
+        )
+        kernel_kwargs = {
+            "BLOCK_M": int(config["BLOCK_M"]),
+            "BLOCK_N": int(config["BLOCK_N"]),
+            "BLOCK_DMODEL": int(config["BLOCK_DMODEL"]),
+            "BLOCK_DMODEL_OUTER": int(config["BLOCK_DMODEL_OUTER"]),
+            "num_warps": int(config["num_warps"]),
+            "num_stages": int(config["num_stages"]),
+        }
+        if launch_context is None:
+            launch_context = self.build_compiling_context(
+                grid=grid,
+                kernel_args=kernel_args,
+                kernel_kwargs=kernel_kwargs,
+                attempted_shared_memory_bytes_per_block=self.estimate_flash_fwd_shared_bytes(
+                    block_m=int(config["BLOCK_M"]),
+                    block_n_pad=int(config["BLOCK_N_PAD"]),
+                    block_dmodel=int(config["BLOCK_DMODEL"]),
+                    element_size=self.dtype_size
+                ),
+            )
+        return FlashAttentionLaunchSpec(
+            grid=grid,
+            kernel_args=kernel_args,
+            kernel_kwargs=kernel_kwargs,
+            launch_context=launch_context,
+            function_name=self.KERNEL_NAME,
+            tune_args=FlashAttenTuneArguments(
+                BLOCK_N=int(config["BLOCK_N"]),
+                BLOCK_M=int(config["BLOCK_M"]),
+                BLOCK_N_PAD=int(config["BLOCK_N_PAD"]),
+                BLOCK_DMODEL=int(config["BLOCK_DMODEL"]),
+                BLOCK_DMODEL_OUTER=int(config["BLOCK_DMODEL_OUTER"]),
+                NUM_WARPS=int(config["num_warps"]),
+                NUM_STAGES=int(config["num_stages"]),
+            ),
+            input_shapes={
+                "q": tuple(int(dim) for dim in q.shape),
+                "k": tuple(int(dim) for dim in k.shape),
+                "v": tuple(int(dim) for dim in v.shape),
+                "o": tuple(int(dim) for dim in o.shape),
+                "lse": (tuple(int(dim) for dim in lse.shape) if lse is not None else None),
+            },
+        )
+
+    def _candidate_configs(self) -> list[dict[str, int | bool]]:
+        candidates: list[dict[str, int | bool]] = []
+        for block_dmodel in self._block_dmodel_candidates():
+            if block_dmodel < self.D and not self._allow_block_dmodel_smaller_than_d():
+                continue
+            for block_dmodel_outer in self._block_dmodel_outer_candidates():
+                if block_dmodel_outer < self.D and not self._allow_block_dmodel_smaller_than_d():
+                    continue
+                for block_n_pad in self._block_n_pad_candidates(block_dmodel):
+                    for block_m in self._block_m_candidates(block_n_pad):
+                        for block_n in self._block_n_candidates(block_n_pad):
+                            for num_warp in self._num_warps(block_m, block_n, block_n_pad, block_dmodel):
+                                for num_stage in self._num_stages(block_n_pad):
+                                    candidates.append(
+                                        {
+                                            "BLOCK_M": block_m,
+                                            "BLOCK_N": block_n,
+                                            "BLOCK_N_PAD": block_n_pad,
+                                            "BLOCK_DMODEL": block_dmodel,
+                                            "BLOCK_DMODEL_OUTER": block_dmodel_outer,
+                                            "num_warps": num_warp,
+                                            "num_stages": num_stage,
+                                        }
+                                    )
+        sorted_candidates = sorted(
+            candidates,
+            key=lambda cfg: (
+                self.estimate_flash_fwd_shared_bytes(
+                    block_m=int(cfg["BLOCK_M"]),
+                    block_n_pad=int(cfg["BLOCK_N_PAD"]),
+                    block_dmodel=int(cfg["BLOCK_DMODEL"]),
+                    element_size=self.dtype_size
+                ),
+                int(cfg["BLOCK_N"]),
+                int(cfg["BLOCK_N_PAD"]),
+                int(cfg["BLOCK_M"]),
+            ),
+            reverse=True,
+        )
+        return sorted_candidates
+
 
 
 __all__ = [
