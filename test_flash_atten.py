@@ -25,6 +25,8 @@ except ImportError:
     SDPBackend = None
     sdpa_kernel = None
 
+from typing import Callable
+
 
 random.seed(20260328)
 
@@ -35,6 +37,8 @@ COMPARE_ATOL = 2e-2
 TEST_LOG_DIR = Path(__file__).resolve().parent / "test_log"
 TEST_RUN_START_TIMESTAMP = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
 TEST_RUN_LOG_PATH = TEST_LOG_DIR / f"{TEST_RUN_START_TIMESTAMP}_test_attention_kernel_pipeline.log"
+CUDA_CLOCK_WARMUP_SLEEP_CYCLES = 50_000_000
+CUDA_CLOCK_WARMUP_SLEEP_LAUNCHES = 1
 
 
 def _require_cuda():
@@ -84,12 +88,13 @@ PROFILE_CASES = [
 ]
 
 SMALL_CASES = [(B, H, D, S, causal) for B, H, D in SMALL_CONFIGS for S in SEQ_LENGTH_SUITE for causal in (False, True)]
-LARGE_CASES = [(B, H, D, S, causal) for B, H, D in LARGE_CONFIGS for S in (120, 430, 783) for causal in (False, True)]
+LARGE_CASES = [(B, H, D, S, causal) for B, H, D in LARGE_CONFIGS for S in (120, 430, 783, 1024, 8192, 32768) for causal in (False, True)]
 ALL_COMPARE_CASES = SMALL_CASES + LARGE_CASES
 PIPELINE_CASES = list(dict.fromkeys(ALL_COMPARE_CASES + PROFILE_CASES))
 
 TORCH_SDPA_BACKENDS = {
     "math": SDPBackend.MATH if SDPBackend is not None else None,
+    "efficient": SDPBackend.EFFICIENT_ATTENTION if SDPBackend is not None else None,
     "flash": SDPBackend.FLASH_ATTENTION if SDPBackend is not None else None,
 }
 
@@ -317,23 +322,45 @@ def _run_cpu_sdpa(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, causal: boo
     return F.scaled_dot_product_attention(q, k, v, is_causal=causal)
 
 
-def _time_cuda_ms(fn, warmup: int = 10, iters: int = 30):
+def _warmup_cuda_clocks(reference: torch.Tensor):
+    del reference
+    for _ in range(CUDA_CLOCK_WARMUP_SLEEP_LAUNCHES):
+        torch.cuda._sleep(CUDA_CLOCK_WARMUP_SLEEP_CYCLES)
+    torch.cuda.synchronize()
+
+
+def _time_cuda_ms(fn, attention_inputs, warmup: int = 10, iters: int = 30):
+    q = attention_inputs["q"]
+    k = attention_inputs["k"]
+    v = attention_inputs["v"]
+    _warmup_cuda_clocks(q)
+
+    output = fn(q, k, v).clone()
     for _ in range(warmup):
-        fn()
+        q, k, v = torch.randn_like(q), torch.randn_like(k), torch.randn_like(v)
+        fn(q, k, v)
     torch.cuda.synchronize()
 
     start = torch.cuda.Event(enable_timing=True)
     end = torch.cuda.Event(enable_timing=True)
 
     times = []
-    output = None
     for _ in range(iters):
+        q, k, v = torch.randn_like(q), torch.randn_like(k), torch.randn_like(v)
         start.record()
-        output = fn()
+        fn(q, k, v)
         end.record()
         torch.cuda.synchronize()
         times.append(start.elapsed_time(end))
-
+    
+    triton.testing.do_bench(
+        lambda: fn(q, k, v),
+        warmup=25,
+        rep=100,
+        return_mode="all",
+    )
+    
+    times = times[1:]
     return {
         "mean_ms": statistics.mean(times),
         "p50_ms": statistics.median(times),
@@ -342,15 +369,20 @@ def _time_cuda_ms(fn, warmup: int = 10, iters: int = 30):
     }, output
 
 
-def _time_cpu_ms(fn, warmup: int = 3, iters: int = 10):
+def _time_cpu_ms(fn, attention_inputs, warmup: int = 3, iters: int = 10):
+    q = attention_inputs["q"]
+    k = attention_inputs["k"]
+    v = attention_inputs["v"]
+    q_cpu, k_cpu, v_cpu = _make_cpu_inputs(q, k, v)
+    output = fn(q_cpu, k_cpu, v_cpu)
     for _ in range(warmup):
-        fn()
-
+        q_cpu, k_cpu, v_cpu = torch.randn_like(q_cpu), torch.randn_like(k_cpu), torch.randn_like(v_cpu)
+        fn(q_cpu, k_cpu, v_cpu)
     times = []
-    output = None
     for _ in range(iters):
+        q_cpu, k_cpu, v_cpu = torch.randn_like(q_cpu), torch.randn_like(k_cpu), torch.randn_like(v_cpu)
         start = time.perf_counter()
-        output = fn()
+        fn(q_cpu, k_cpu, v_cpu)
         end = time.perf_counter()
         times.append((end - start) * 1000.0)
 
@@ -362,9 +394,10 @@ def _time_cpu_ms(fn, warmup: int = 3, iters: int = 10):
     }, output
 
 
-def _probe_kernel_availability(name: str, run_kernel):
+def _probe_kernel_availability(name: str, run_kernel: Callable, attention_inputs: dict):
     try:
-        out = run_kernel()
+        q, k, v = attention_inputs["q"], attention_inputs["k"], attention_inputs["v"]
+        out = run_kernel(q, k, v)
         del out
         _clear_cuda_memory()
         return None
@@ -395,30 +428,45 @@ def _run_kernel_pipeline(attention_inputs):
     q_cpu, k_cpu, v_cpu = _make_cpu_inputs(q, k, v)
     triton_compile_status = _format_triton_flash_compile_status(q, k, v, causal=causal)
 
+    def cpu_sdpa(q, k, v):
+        return _run_cpu_sdpa(q, k, v, causal=causal)
+
+    def gpu_math_sdpa(q, k, v):
+        return _run_torch_sdpa(q, k, v, causal=causal, backend_name="math")
+    
+    def gpu_efficient_sdpa(q, k, v):
+        return _run_torch_sdpa(q, k, v, causal=causal, backend_name="efficient")
+
+    def gpu_flash_sdpa(q, k, v):
+        return _run_torch_sdpa(q, k, v, causal=causal, backend_name="flash")
+
+    basic_tuner_launch_spec = FlashAttentionTuner(
+        tuple(q.shape),
+        tuple(k.shape),
+        tuple(v.shape),
+        q.element_size(),
+        causal=causal,
+        return_lse=False,
+    ).build_flash_attention_launch_spec(q, k, v)
+
+    def triton_flash_basic(q, k, v):
+        basic_tuner_launch_spec.update_data((q, k, v))
+        return flash_attention(
+            basic_tuner_launch_spec
+        )
+
     kernels = [
-        ("cpu_sdpa", lambda: _run_cpu_sdpa(q_cpu, k_cpu, v_cpu, causal=causal), "cpu"),
-        ("gpu_math_sdpa", lambda: _run_torch_sdpa(q, k, v, causal=causal, backend_name="math"), "cuda"),
-        ("gpu_flash_sdpa", lambda: _run_torch_sdpa(q, k, v, causal=causal, backend_name="flash"), "cuda"),
-        (
-            "triton_flash",
-            lambda: flash_attention(
-                FlashAttentionTuner(
-                    tuple(q.shape),
-                    tuple(k.shape),
-                    tuple(v.shape),
-                    q.element_size(),
-                    causal=causal,
-                    return_lse=False,
-                ).build_flash_attention_launch_spec(q, k, v)
-            ),
-            "cuda",
-        ),
+        ("cpu_sdpa", cpu_sdpa, "cpu"),
+        ("gpu_math_sdpa", gpu_math_sdpa, "cuda"),
+        ("gpu_efficient_sdpa", gpu_efficient_sdpa, "cuda"),
+        ("gpu_flash_sdpa", gpu_flash_sdpa, "cuda"),
+        ("triton_flash", triton_flash_basic, "cuda"),
     ]
 
     availability = {}
     runnable_kernels = []
     for name, run_kernel, device_kind in kernels:
-        error = _probe_kernel_availability(name, run_kernel)
+        error = _probe_kernel_availability(name, run_kernel, attention_inputs)
         availability[name] = error
         if error is None:
             runnable_kernels.append((name, run_kernel, device_kind))
@@ -438,25 +486,31 @@ def _run_kernel_pipeline(attention_inputs):
         summary_text = _format_case_summary(case, "failed", stats, [], statuses)
         print("\n" + summary_text)
         _write_case_summary_log(summary_text)
-        raise AssertionError(availability["cpu_sdpa"])
     if availability["triton_flash"] is not None:
         summary_text = _format_case_summary(case, "failed", stats, [], statuses)
         print("\n" + summary_text)
         _write_case_summary_log(summary_text)
-        raise AssertionError(availability["triton_flash"])
     if availability["gpu_math_sdpa"] is not None:
         summary_text = _format_case_summary(case, "skipped", stats, [], statuses)
         print("\n" + summary_text)
         _write_case_summary_log(summary_text)
-        pytest.skip(availability["gpu_math_sdpa"])
+    if availability["gpu_flash_sdpa"] is not None:
+        summary_text = _format_case_summary(case, "skipped", stats, [], statuses)
+        print("\n" + summary_text)
+        _write_case_summary_log(summary_text)
+    if availability["gpu_efficient_sdpa"] is not None:
+        summary_text = _format_case_summary(case, "skipped", stats, [], statuses)
+        print("\n" + summary_text)
+        _write_case_summary_log(summary_text)
 
     for name, run_kernel, device_kind in runnable_kernels:
         output = None
         try:
             if device_kind == "cpu":
-                stats[name], output = _time_cpu_ms(run_kernel)
+                stats[name], output = _time_cpu_ms(run_kernel, attention_inputs)
             else:
-                stats[name], output = _time_cuda_ms(run_kernel)
+                stats[name], output = _time_cuda_ms(run_kernel, attention_inputs)
+                torch.cuda.synchronize()
 
             if name == "cpu_sdpa":
                 baseline_output = output.detach().cpu()

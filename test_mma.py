@@ -30,11 +30,10 @@ CUDA_CLOCK_WARMUP_SLEEP_CYCLES = 50_000_000
 CUDA_CLOCK_WARMUP_SLEEP_LAUNCHES = 1
 
 KERNEL_RUNTIME_SERIES = {
-    "cpu_torch_matmul": "cpu",
-    "gpu_torch_matmul": "torch_cuda",
-    "triton_2d_contiguous": "triton_2d_contiguous",
+    "cpu_torch_matmul": "cpu_torch_matmul",
+    "gpu_torch_matmul": "gpu_torch_matmul",
+    "triton_2d_contiguous": "ours",
 }
-
 
 def _require_cuda():
     if not torch.cuda.is_available():
@@ -169,6 +168,7 @@ def _collect_mma_kernel_pipeline_folder_rows(target_folder: Path, datatype=torch
     return rows
 
 
+
 def _render_mma_kernel_pipeline_folder_graph(
     target_folder: Path,
     datatype=torch.float16,
@@ -185,10 +185,13 @@ def _render_mma_kernel_pipeline_folder_graph(
 
     target_folder = Path(target_folder)
     output_path = Path(output_path) if output_path is not None else target_folder / "mma_kernel_pipeline_runtime_tflops.png"
+    title_suffix = ""
+    if torch.cuda.is_available():
+        title_suffix = f" - {torch.cuda.get_device_name(torch.cuda.current_device())}"
 
     active_kernels = [
         kernel_name
-        for kernel_name in MMA_FOLDER_GRAPH_KERNELS
+        for kernel_name in KERNEL_RUNTIME_SERIES
         if any(math.isfinite(row["runtimes"][kernel_name]) and row["runtimes"][kernel_name] > 0 for row in rows)
     ]
     if not active_kernels:
@@ -223,11 +226,11 @@ def _render_mma_kernel_pipeline_folder_graph(
     runtime_ax.set_xlabel("Data shape (M x N x K)")
     runtime_ax.set_ylabel("Mean runtime (ms)")
     runtime_ax.set_yscale("log")
-    runtime_ax.set_title("MMA Kernel Mean Runtime")
+    runtime_ax.set_title(f"MMA Kernel Mean Runtime{title_suffix}")
 
     tflops_ax.set_xlabel("Data shape (M x N x K)")
     tflops_ax.set_ylabel("TFLOPs")
-    tflops_ax.set_title("MMA Kernel Throughput")
+    tflops_ax.set_title(f"MMA Kernel Throughput{title_suffix}")
 
     fig.tight_layout()
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -1,24 +1,11 @@
 import logging
 from dataclasses import dataclass
-from typing import Any
 
 import torch
 import triton
 import triton.language as tl
-from triton.language.extra import cuda as tl_cuda
-from triton.runtime.errors import OutOfResources
-
-from exceptions import (
-    OutOfResourcesWithDetail,
-    _resource_usage_summary,
-    estimate_flash_fwd_shared_bytes,
-    get_sm_resource_limits,
-)
-from tuner import LaunchSpec, Tuner
 from tuner import (
-    FlashAttenTuneArguments,
-    FlashAttentionLaunchSpec,
-    FlashAttentionTuner,
+    FlashAttentionLaunchSpec
 )
 
 logger = logging.getLogger(__name__)
@@ -59,6 +46,7 @@ def _flash_attn_fwd_kernel_basic(
     HAS_LSE: tl.constexpr,
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
+    BLOCK_N_PAD: tl.constexpr,
     BLOCK_DMODEL: tl.constexpr,
 ):
     pid_m = tl.program_id(0)
@@ -68,7 +56,7 @@ def _flash_attn_fwd_kernel_basic(
     h = pid_bh % H
 
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
+    offs_n = tl.arange(0, BLOCK_N_PAD)
     offs_d = tl.arange(0, BLOCK_DMODEL)
 
     q_ptrs = (
@@ -185,7 +173,6 @@ def _flash_attn_fwd_kernel_optimize_shared_mem(
 ):
     pid_m = tl.program_id(0)
     pid_bh = tl.program_id(1)
-    load_q_mask = True
     
     b = pid_bh // H
     h = pid_bh % H
@@ -202,7 +189,6 @@ def _flash_attn_fwd_kernel_optimize_shared_mem(
         + offs_d[None, :] * stride_qd
     )
     q_mask = (offs_m[:, None] < M) & (offs_d[None, :] < D)
-    q_load_start_t = 0
     
     q = tl.load(q_ptrs, mask=q_mask, other=0.0)
 

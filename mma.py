@@ -64,18 +64,15 @@ def _select_2d_contiguous_config(m: int, n: int, k: int) -> tuple[int, int, int,
     major, _ = get_architecture()
     if k % 32 != 0:
         raise ValueError("fast 2D contiguous matmul requires K % 32 == 0")
+    num_stage = 1 if major < 8 else 3
     if m >= 2048 and n >= 2048 and m % 128 == 0 and n % 128 == 0:
-        num_stage = 1 if major < 8 else 3
         return 128, 128, 32, 8, 4, num_stage
     if m % 128 == 0 and n % 64 == 0:
-        num_stage = 1 if major < 8 else 3
         return 128, 64, 32, 8, 4, num_stage
     if m % 128 == 0 and n % 128 == 0:
-        num_stage = 1 if major < 8 else 3
-        return 128, 128, 32, 8, 4, 3
+        return 128, 128, 32, 8, 4, num_stage
     if m % 64 == 0 and n % 256 == 0:
-        num_stage = 1 if major < 8 else 3
-        return 64, 256, 32, 2, 8, 5
+        return 64, 256, 32, 2, 8, num_stage
     raise ValueError(
         "fast 2D contiguous matmul requires a supported divisible tile: "
         "(M % 128 == 0 and N % 64 == 0), "

@@ -8,9 +8,13 @@ Use this file as the project handoff context for AI coding tools.
 - VS Code workspace default is pinned in `.vscode/settings.json`.
 
 ## Environment Setup
-
+for Ampere GPU,
 ```bash
 ~/miniconda3/envs/py312/bin/python -m pip install -r requirements.txt
+```
+for Turing GPU,
+```bash
+~/miniconda3/envs/py312/bin/python -m pip install -r requirements_pre_ampere.txt
 ```
 
 ## Test Commands

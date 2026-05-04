@@ -55,6 +55,19 @@ class FlashAttentionLaunchSpec(LaunchSpec):
     tune_args: FlashAttenTuneArguments
     input_shapes: dict[str, tuple[int, ...] | None]
 
+    def update_data(self, data):
+        q, k, v = data
+        object.__setattr__(
+            self,
+            "kernel_args",
+            (
+                q,
+                k,
+                v,
+                *self.kernel_args[3:],
+            ),
+        )
+
 
 @dataclass(frozen=True)
 class FlashAttenTuneArguments:
