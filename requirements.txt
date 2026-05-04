@@ -1,7 +1,14 @@
 # Core runtime for flash_atten.py
-# Latest stable versions observed on PyPI as of 2026-03-28.
-torch==2.6.0
-triton==3.2.0
+pillow==12.2.0
+numpy==2.4.4
+matplotlib==3.10.9
+# PyTorch pinned to 2.9.x patch with CUDA 12.8 GPU wheel, which contains triton 3.5.1
+# If you are on macOS/CPU-only, replace with: torch==2.9.1
+--extra-index-url https://download.pytorch.org/whl/cu128
+torch==2.9.1+cu128
 
 # Test runner for test_flash_atten.py
 pytest==9.0.2
+psutil
+
+# install lastest official flash attention 2 later
