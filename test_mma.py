@@ -84,6 +84,33 @@ def _matmul_tflops(M: int, K: int, N: int, runtime_ms: float):
     return flops / (runtime_ms * 1.0e9)
 
 
+def _dtype_itemsize(datatype=torch.float16):
+    if isinstance(datatype, torch.dtype):
+        return torch.empty((), dtype=datatype).element_size()
+
+    dtype_name = str(datatype).lower().replace("torch.", "").replace("numpy.", "").replace("np.", "")
+    dtype_itemsize = {
+        "float16": 2,
+        "half": 2,
+        "bfloat16": 2,
+        "float32": 4,
+        "float": 4,
+        "float64": 8,
+        "double": 8,
+        "int8": 1,
+        "uint8": 1,
+        "int16": 2,
+        "uint16": 2,
+        "int32": 4,
+        "uint32": 4,
+        "int64": 8,
+        "uint64": 8,
+    }.get(dtype_name)
+    if dtype_itemsize is None:
+        raise ValueError(f"Unsupported datatype for graph data-size calculation: {datatype!r}")
+    return dtype_itemsize
+
+
 def _parse_mma_kernel_pipeline_rows(log_path: Path):
     log_path = Path(log_path)
     rows = []
@@ -121,26 +148,33 @@ def _parse_mma_kernel_pipeline_rows(log_path: Path):
     return rows
 
 
-def _parse_mma_kernel_pipeline_log(log_path: Path):
-    rows = _parse_mma_kernel_pipeline_rows(log_path)
-    data = {name: [] for name in KERNEL_RUNTIME_SERIES}
-    case_labels = []
+def _collect_mma_kernel_pipeline_folder_rows(target_folder: Path, datatype=torch.float16):
+    target_folder = Path(target_folder)
+    element_size = _dtype_itemsize(datatype)
+    rows = []
 
-    rows.sort(key=lambda row: (row["data_size"], row["M"], row["K"], row["N"]))
-    for row in rows:
-        case_labels.append(
-            f"{row['M']}\n"
-            f"{row['K']}\n"
-            f"{row['N']}"
-        )
-        for kernel_name in KERNEL_RUNTIME_SERIES:
-            data[kernel_name].append(row["runtimes"][kernel_name])
+    for log_path in sorted(target_folder.glob("*.log")):
+        for row in _parse_mma_kernel_pipeline_rows(log_path):
+            M, K, N = row["M"], row["K"], row["N"]
+            rows.append(
+                {
+                    **row,
+                    "log_path": log_path,
+                    "label": f"{M}x{N}x{K}",
+                    "data_bytes": (M * K + K * N + M * N) * element_size,
+                }
+            )
 
-    return data, case_labels
+    rows.sort(key=lambda row: (row["data_bytes"], row["M"], row["K"], row["N"], row["log_path"].name))
+    return rows
 
 
-def _render_mma_kernel_pipeline_tflops_by_k_graph(log_path: Path):
-    rows = _parse_mma_kernel_pipeline_rows(log_path)
+def _render_mma_kernel_pipeline_folder_graph(
+    target_folder: Path,
+    datatype=torch.float16,
+    output_path: Path | None = None,
+):
+    rows = _collect_mma_kernel_pipeline_folder_rows(target_folder, datatype=datatype)
     if not rows:
         return None
 
@@ -149,107 +183,69 @@ def _render_mma_kernel_pipeline_tflops_by_k_graph(log_path: Path):
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
-    fig, ax = plt.subplots(figsize=(14.0, 6.0), dpi=150)
-    k_values = sorted({row["K"] for row in rows})
-    for kernel_name, legend_label in KERNEL_RUNTIME_SERIES.items():
-        y_values = []
-        for K in k_values:
-            tflops_values = [
-                _matmul_tflops(row["M"], row["K"], row["N"], row["runtimes"][kernel_name])
-                for row in rows
-                if row["K"] == K
-            ]
-            finite_values = [value for value in tflops_values if math.isfinite(value) and value > 0]
-            y_values.append(statistics.mean(finite_values) if finite_values else float("nan"))
+    target_folder = Path(target_folder)
+    output_path = Path(output_path) if output_path is not None else target_folder / "mma_kernel_pipeline_runtime_tflops.png"
 
-        if any(math.isfinite(value) and value > 0 for value in y_values):
-            ax.plot(k_values, y_values, marker="o", markersize=4, linewidth=1.8, label=legend_label)
+    active_kernels = [
+        kernel_name
+        for kernel_name in MMA_FOLDER_GRAPH_KERNELS
+        if any(math.isfinite(row["runtimes"][kernel_name]) and row["runtimes"][kernel_name] > 0 for row in rows)
+    ]
+    if not active_kernels:
+        return None
 
-    ax.set_ylabel("Average TFLOPs")
-    ax.set_xlabel("K")
-    ax.set_xscale("log", base=2)
-    ax.set_xticks(k_values)
-    ax.set_xticklabels([str(K) for K in k_values])
-    ax.set_title("Average MMA Kernel Pipeline TFLOPs by K")
-    ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
-    ax.legend(loc="best")
+    x_values = list(range(len(rows)))
+    case_labels = [row["label"] for row in rows]
+    bar_width = min(0.16, 0.82 / len(active_kernels))
+    group_offset = (len(active_kernels) - 1) * bar_width / 2
+
+    fig_width = max(12.0, min(42.0, 1.2 * len(rows) + 7.0))
+    fig, (runtime_ax, tflops_ax) = plt.subplots(1, 2, figsize=(fig_width, 6.0), dpi=150)
+
+    for kernel_index, kernel_name in enumerate(active_kernels):
+        offset = kernel_index * bar_width - group_offset
+        bar_x = [x + offset for x in x_values]
+        runtime_values = [row["runtimes"][kernel_name] for row in rows]
+        tflops_values = [
+            _matmul_tflops(row["M"], row["K"], row["N"], row["runtimes"][kernel_name])
+            for row in rows
+        ]
+        legend_label = KERNEL_RUNTIME_SERIES[kernel_name]
+        runtime_ax.bar(bar_x, runtime_values, width=bar_width, label=legend_label)
+        tflops_ax.bar(bar_x, tflops_values, width=bar_width, label=legend_label)
+
+    for ax in (runtime_ax, tflops_ax):
+        ax.set_xticks(x_values)
+        ax.set_xticklabels(case_labels, rotation=35, ha="right", fontsize=8)
+        ax.grid(True, axis="y", linestyle="--", linewidth=0.5, alpha=0.4)
+        ax.legend(loc="best", fontsize=8)
+
+    runtime_ax.set_xlabel("Data shape (M x N x K)")
+    runtime_ax.set_ylabel("Mean runtime (ms)")
+    runtime_ax.set_yscale("log")
+    runtime_ax.set_title("MMA Kernel Mean Runtime")
+
+    tflops_ax.set_xlabel("Data shape (M x N x K)")
+    tflops_ax.set_ylabel("TFLOPs")
+    tflops_ax.set_title("MMA Kernel Throughput")
+
     fig.tight_layout()
-
-    graph_path = Path(log_path).with_name(f"{Path(log_path).stem}_tflops_by_k.png")
-    fig.savefig(graph_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(output_path)
     plt.close(fig)
-    return graph_path
+    return output_path
 
 
-def render_mma_kernel_pipeline_tflops_by_k_graph(log_path: Path):
-    return _render_mma_kernel_pipeline_tflops_by_k_graph(log_path)
-
-
-def _render_mma_kernel_pipeline_runtime_graph(log_path: Path):
-    data, case_labels = _parse_mma_kernel_pipeline_log(log_path)
-    valid_indices = [
-        index
-        for index in range(len(case_labels))
-        if any(
-            math.isfinite(data[kernel_name][index]) and data[kernel_name][index] > 0
-            for kernel_name in KERNEL_RUNTIME_SERIES
-        )
-    ]
-    if not valid_indices:
-        return None
-
-    case_labels = [case_labels[index] for index in valid_indices]
-    data = {
-        kernel_name: [values[index] for index in valid_indices]
-        for kernel_name, values in data.items()
-    }
-    case_count = len(case_labels)
-
-    positive_values = [
-        value
-        for values in data.values()
-        for value in values
-        if math.isfinite(value) and value > 0
-    ]
-    if not positive_values:
-        return None
-
-    import matplotlib
-
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-
-    x_values = list(range(1, case_count + 1))
-    width = min(80.0, max(14.0, case_count * 0.85))
-    fig, ax = plt.subplots(figsize=(width, 8.0), dpi=150)
-
-    for kernel_name, legend_label in KERNEL_RUNTIME_SERIES.items():
-        y_values = data[kernel_name]
-        if any(math.isfinite(value) and value > 0 for value in y_values):
-            ax.plot(x_values, y_values, marker="o", markersize=3, linewidth=1.5, label=legend_label)
-
-    ax.set_yscale("log")
-    ax.set_xlabel("Sorted by data size M*K + K*N + M*N; x-axis labels are stacked as: M / K / N")
-    ax.set_ylabel("Runtime mean (ms, log scale)")
-    ax.set_title("MMA Kernel Pipeline Runtime")
-    if case_count == 1:
-        ax.set_xlim(0.5, 1.5)
-    else:
-        ax.set_xlim(1, case_count)
-    ax.set_xticks(x_values)
-    ax.set_xticklabels(case_labels, rotation=0, ha="center", fontsize=7)
-    ax.grid(True, which="both", linestyle="--", linewidth=0.5, alpha=0.4)
-    ax.legend(loc="best")
-    fig.subplots_adjust(bottom=0.25, left=0.07, right=0.99, top=0.92)
-
-    graph_path = Path(log_path).with_name(f"{Path(log_path).stem}_runtime.png")
-    fig.savefig(graph_path)
-    plt.close(fig)
-    return graph_path
-
-
-def render_mma_kernel_pipeline_runtime_graph(log_path: Path):
-    return _render_mma_kernel_pipeline_runtime_graph(log_path)
+def render_mma_kernel_pipeline_folder_graph(
+    target_folder: Path,
+    datatype=torch.float16,
+    output_path: Path | None = None,
+):
+    return _render_mma_kernel_pipeline_folder_graph(
+        target_folder,
+        datatype=datatype,
+        output_path=output_path,
+    )
 
 
 def _make_inputs(M: int, K: int, N: int):
