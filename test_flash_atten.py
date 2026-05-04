@@ -48,6 +48,7 @@ KERNEL_RUNTIME_SERIES = {
     "gpu_flash_sdpa": "torch SDPA flash",
     "triton_flash_basic": "ours basic",
     "triton_flash_opt_shared_mem": "ours opt shared mem",
+    "triton_flash_block_d_nomask": "ours D splice"
 }
 
 
@@ -755,13 +756,13 @@ def _run_kernel_pipeline(attention_inputs):
     }
 
     kernels = [
-        # ("cpu_sdpa", cpu_sdpa, "cpu"),
-        # ("gpu_math_sdpa", gpu_math_sdpa, "cuda"),
+        ("cpu_sdpa", cpu_sdpa, "cpu"),
+        ("gpu_math_sdpa", gpu_math_sdpa, "cuda"),
         ("gpu_efficient_sdpa", gpu_efficient_sdpa, "cuda"),
         ("gpu_flash_sdpa", gpu_flash_sdpa, "cuda"),
         ("triton_flash_basic", triton_flash_basic, "cuda"),
         ("triton_flash_opt_shared_mem", triton_flash_opt_shared_mem, "cuda"),
-        # ("triton_flash_block_d_nomask", triton_flash_block_d_nomask, "cuda")
+        ("triton_flash_block_d_nomask", triton_flash_block_d_nomask, "cuda")
     ]
 
     availability = {}
@@ -797,7 +798,7 @@ def _run_kernel_pipeline(attention_inputs):
             if name == "cpu_sdpa":
                 baseline_output = output.detach().cpu()
             else:
-                # _assert_attention_close(output.detach().cpu().float(), baseline_output.float())
+                _assert_attention_close(output.detach().cpu().float(), baseline_output.float())
                 statuses.append(f"{name}=passed")
         except AssertionError:
             stats.setdefault(name, None)
