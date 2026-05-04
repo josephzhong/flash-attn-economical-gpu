@@ -3,6 +3,8 @@ import logging
 import triton
 import triton.language as tl
 
+from tuner import get_architecture
+
 @triton.jit
 def _matmul_contiguous_kernel(
     a_ptr,
@@ -15,6 +17,7 @@ def _matmul_contiguous_kernel(
     BLOCK_N: tl.constexpr,
     BLOCK_K: tl.constexpr,
     GROUP_M: tl.constexpr,
+    USE_CACHE_EVICTION_HINTS: tl.constexpr,
 ):
     pid = tl.program_id(axis=0)
     num_pid_m = tl.cdiv(M, BLOCK_M)
@@ -35,8 +38,12 @@ def _matmul_contiguous_kernel(
 
     accumulator = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
     for _ in range(0, K, BLOCK_K):
-        a = tl.load(a_ptrs, cache_modifier=".ca", eviction_policy="evict_first")
-        b = tl.load(b_ptrs, cache_modifier=".ca", eviction_policy="evict_last")
+        if USE_CACHE_EVICTION_HINTS:
+            a = tl.load(a_ptrs, cache_modifier=".ca", eviction_policy="evict_first")
+            b = tl.load(b_ptrs, cache_modifier=".ca", eviction_policy="evict_last")
+        else:
+            a = tl.load(a_ptrs)
+            b = tl.load(b_ptrs)
         accumulator = tl.dot(a, b, acc=accumulator)
         a_ptrs += BLOCK_K
         b_ptrs += BLOCK_K * N
@@ -45,16 +52,29 @@ def _matmul_contiguous_kernel(
     tl.store(c_ptrs, accumulator.to(tl.float16), cache_modifier=".cg")
 
 
+def _supports_contiguous_cache_eviction_hints(device=None) -> bool:
+    if not torch.cuda.is_available():
+        return False
+
+    major, _ = torch.cuda.get_device_capability(device)
+    return major >= 8
+
+
 def _select_2d_contiguous_config(m: int, n: int, k: int) -> tuple[int, int, int, int, int, int]:
+    major, _ = get_architecture()
     if k % 32 != 0:
         raise ValueError("fast 2D contiguous matmul requires K % 32 == 0")
     if m >= 2048 and n >= 2048 and m % 128 == 0 and n % 128 == 0:
-        return 128, 128, 32, 8, 4, 3
+        num_stage = 1 if major < 8 else 3
+        return 128, 128, 32, 8, 4, num_stage
     if m % 128 == 0 and n % 64 == 0:
-        return 128, 64, 32, 8, 4, 3
+        num_stage = 1 if major < 8 else 3
+        return 128, 64, 32, 8, 4, num_stage
     if m % 128 == 0 and n % 128 == 0:
+        num_stage = 1 if major < 8 else 3
         return 128, 128, 32, 8, 4, 3
     if m % 64 == 0 and n % 256 == 0:
+        num_stage = 1 if major < 8 else 3
         return 64, 256, 32, 2, 8, 5
     raise ValueError(
         "fast 2D contiguous matmul requires a supported divisible tile: "
@@ -65,5 +85,6 @@ def _select_2d_contiguous_config(m: int, n: int, k: int) -> tuple[int, int, int,
 
 __all__ = [
     "_select_2d_contiguous_config",
+    "_supports_contiguous_cache_eviction_hints",
     "_matmul_contiguous_kernel",
 ]

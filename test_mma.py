@@ -12,7 +12,7 @@ import torch
 import triton
 import triton.language as tl
 
-from mma import _matmul_contiguous_kernel, _select_2d_contiguous_config
+from mma import _matmul_contiguous_kernel, _select_2d_contiguous_config, _supports_contiguous_cache_eviction_hints
 
 
 random.seed(20260328)
@@ -323,6 +323,7 @@ def _run_triton_2d_contiguous(a: torch.Tensor, b: torch.Tensor):
         BLOCK_N=block_n,
         BLOCK_K=block_k,
         GROUP_M=group_m,
+        USE_CACHE_EVICTION_HINTS=_supports_contiguous_cache_eviction_hints(a.device),
         num_warps=num_warps,
         num_stages=num_stages,
     )

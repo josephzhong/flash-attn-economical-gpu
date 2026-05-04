@@ -12,6 +12,9 @@ from exceptions import (
     get_sm_resource_limits,
 )
 
+def get_architecture():
+     major, minor = torch.cuda.get_device_capability(torch.cuda.current_device())
+     return major, minor
 
 @dataclass(frozen=True)
 class LaunchSpec:
@@ -617,4 +620,5 @@ __all__ = [
     "Tuner",
     "_get_max_shared_mem_bytes",
     "_next_power_of_two",
+    "get_architecture",
 ]
