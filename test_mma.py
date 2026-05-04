@@ -425,9 +425,13 @@ def _format_speedup_ratios(stats):
 
 
 def _run_kernel_pipeline(mma_inputs):
+    a = mma_inputs["a"]
+    b = mma_inputs["b"]
     case = mma_inputs["case"]
     triton_2d_detail = "unavailable"
     try:
+        M, K = a.shape
+        _, N = b.shape
         block_m, block_n, block_k, group_m, num_warps, num_stages = _select_2d_contiguous_config(M, N, K)
         triton_2d_detail = (
             f"BLOCK_M={block_m} BLOCK_N={block_n} BLOCK_K={block_k} "
