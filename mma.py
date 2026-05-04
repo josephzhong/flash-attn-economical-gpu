@@ -2,7 +2,7 @@ import logging
 
 import triton
 import triton.language as tl
-
+import torch
 from tuner import get_architecture
 
 @triton.jit
